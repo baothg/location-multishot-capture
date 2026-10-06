@@ -634,13 +634,16 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
                 "Bạn đang đứng cách vị trí cho phép ${formatDistance(distance)}. " +
                     "Vui lòng di chuyển vào phạm vi cho phép rồi thử lại."
             }
+        val locationError = result.errorMessage
+            ?: "Thiếu tọa độ vị trí hiện tại để đối chiếu với vị trí cho phép."
         val message = distanceMessage ?: (
-            "Vui lòng kiểm tra lại kết nối định vị của thiết bị " +
-                "rồi thử lại."
+            "$locationError\n\n" +
+                "Hãy kiểm tra quyền truy cập vị trí chính xác, bật dịch vụ Vị trí/GPS " +
+                "và kết nối Wi-Fi hoặc dữ liệu di động rồi thử lại."
             )
         materialDialogBuilder()
             .setTitle(
-                if (distanceMessage != null) "Vị trí không hợp lệ" else "Không xác định được vị trí",
+                if (distanceMessage != null) "Vị trí không hợp lệ" else "Thiếu thông tin định vị",
             )
             .setMessage(message)
             .setCancelable(false)

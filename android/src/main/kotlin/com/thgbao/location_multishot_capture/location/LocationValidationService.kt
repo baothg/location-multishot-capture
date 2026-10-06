@@ -74,7 +74,9 @@ class LocationValidationService(
 
     private fun startValidationLocked() {
         if (!hasLocationPermission()) {
-            completePendingWithFallbackLocked("Thiếu quyền vị trí.")
+            completePendingWithFallbackLocked(
+                "Ứng dụng chưa được cấp quyền truy cập vị trí chính xác (ACCESS_FINE_LOCATION).",
+            )
             return
         }
 
@@ -84,7 +86,9 @@ class LocationValidationService(
         ).filter(locationManager::isProviderEnabled)
 
         if (providers.isEmpty()) {
-            completePendingWithFallbackLocked("Dịch vụ vị trí đang tắt.")
+            completePendingWithFallbackLocked(
+                "Dịch vụ Vị trí (GPS/mạng) trên thiết bị đang tắt.",
+            )
             return
         }
 
@@ -102,7 +106,7 @@ class LocationValidationService(
 
         val timeout = Runnable {
             finishValidation { captureIds ->
-                fallbackOrInvalid(captureIds, "Không xác định được vị trí.")
+                fallbackOrInvalid(captureIds, noLocationMessage())
             }
         }
         timeoutRunnable = timeout
@@ -124,7 +128,10 @@ class LocationValidationService(
 
         if (requestedProviderCount == 0) {
             finishValidation { captureIds ->
-                fallbackOrInvalid(captureIds, "Không xác định được vị trí.")
+                fallbackOrInvalid(
+                    captureIds,
+                    "Không thể đăng ký lấy tọa độ từ GPS/mạng: hệ thống từ chối yêu cầu.",
+                )
             }
         }
     }
@@ -178,6 +185,12 @@ class LocationValidationService(
             return toResult(captureIds, lastKnownLocation)
         }
         return invalidResult(captureIds, errorMessage)
+    }
+
+    private fun noLocationMessage(): String {
+        return "Không lấy được tọa độ vị trí hiện tại: GPS/mạng không trả vị trí mới trong " +
+            "${LOCATION_TIMEOUT_MS / 1000} giây, và không có vị trí lưu trong " +
+            "${LOCATION_CACHE_MAX_AGE_MS / 60_000} phút gần nhất."
     }
 
     private fun getLastKnownLocation(): Location? {
