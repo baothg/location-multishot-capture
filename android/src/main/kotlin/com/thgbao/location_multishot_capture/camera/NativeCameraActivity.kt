@@ -630,7 +630,6 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
         result: LocationValidationService.LocationValidationResult,
     ) {
         val distanceMessage = result.distanceToTargetMeters
-            ?.takeIf { result.location != null }
             ?.let { distance ->
                 "Bạn đang đứng cách vị trí cho phép ${formatDistance(distance)}. " +
                     "Vui lòng di chuyển vào phạm vi cho phép rồi thử lại."

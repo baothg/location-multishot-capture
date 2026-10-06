@@ -173,7 +173,36 @@ class LocationValidationService(
         ) {
             return toResult(captureIds, cached.location)
         }
+        val lastKnownLocation = getLastKnownLocation()
+        if (lastKnownLocation != null) {
+            return toResult(captureIds, lastKnownLocation)
+        }
         return invalidResult(captureIds, errorMessage)
+    }
+
+    private fun getLastKnownLocation(): Location? {
+        if (!hasLocationPermission()) {
+            return null
+        }
+        val now = System.currentTimeMillis()
+        return listOf(
+            LocationManager.GPS_PROVIDER,
+            LocationManager.NETWORK_PROVIDER,
+        ).mapNotNull { provider ->
+            try {
+                if (locationManager.isProviderEnabled(provider)) {
+                    locationManager.getLastKnownLocation(provider)
+                } else {
+                    null
+                }
+            } catch (_: SecurityException) {
+                null
+            } catch (_: IllegalArgumentException) {
+                null
+            }
+        }.filter { location ->
+            now - location.time in 0L..LOCATION_CACHE_MAX_AGE_MS
+        }.maxByOrNull(Location::getTime)
     }
 
     private fun notifyWarmup(
