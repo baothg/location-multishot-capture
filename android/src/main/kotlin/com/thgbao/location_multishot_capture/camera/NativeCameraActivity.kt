@@ -613,26 +613,37 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
         isLocationWarmupInProgress = true
         loadingOverlay.visibility = View.VISIBLE
         updateCaptureUi()
-        locationService.warmupLocation { success ->
+        locationService.warmupLocation { result ->
             if (isFinishing || resultDelivered) {
                 return@warmupLocation
             }
             isLocationWarmupInProgress = false
             loadingOverlay.visibility = View.GONE
             updateCaptureUi()
-            if (!success) {
-                showLocationWarmupError()
+            if (result.location == null || !result.isValid) {
+                showLocationWarmupError(result)
             }
         }
     }
 
-    private fun showLocationWarmupError() {
-        materialDialogBuilder()
-            .setTitle("Không xác định được vị trí")
-            .setMessage(
-                "Vui lòng kiểm tra lại kết nối định vị của thiết bị " +
-                    "rồi thử lại.",
+    private fun showLocationWarmupError(
+        result: LocationValidationService.LocationValidationResult,
+    ) {
+        val distanceMessage = result.distanceToTargetMeters
+            ?.takeIf { result.location != null }
+            ?.let { distance ->
+                "Bạn đang đứng cách vị trí cho phép ${formatDistance(distance)}. " +
+                    "Vui lòng di chuyển vào phạm vi cho phép rồi thử lại."
+            }
+        val message = distanceMessage ?: (
+            "Vui lòng kiểm tra lại kết nối định vị của thiết bị " +
+                "rồi thử lại."
             )
+        materialDialogBuilder()
+            .setTitle(
+                if (distanceMessage != null) "Vị trí không hợp lệ" else "Không xác định được vị trí",
+            )
+            .setMessage(message)
             .setCancelable(false)
             .setNegativeButton("Đóng") { _, _ -> finishCancelled() }
             .show()

@@ -38,14 +38,14 @@ class LocationValidationService(
     private var timeoutRunnable: Runnable? = null
     private var validationInProgress = false
     private var cachedLocationResult: CachedLocationResult? = null
-    private var warmupCallback: ((Boolean) -> Unit)? = null
+    private var warmupCallback: ((LocationValidationResult) -> Unit)? = null
 
     fun isLocationServiceEnabled(): Boolean {
         return locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER) ||
             locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
     }
 
-    fun warmupLocation(callback: (Boolean) -> Unit) {
+    fun warmupLocation(callback: (LocationValidationResult) -> Unit) {
         synchronized(lock) {
             warmupCallback = callback
             if (!validationInProgress) {
@@ -177,14 +177,13 @@ class LocationValidationService(
     }
 
     private fun notifyWarmup(
-        warmup: ((Boolean) -> Unit)?,
+        warmup: ((LocationValidationResult) -> Unit)?,
         result: LocationValidationResult,
     ) {
         if (warmup == null) {
             return
         }
-        val success = result.location != null && result.isValid
-        mainHandler.post { warmup(success) }
+        mainHandler.post { warmup(result) }
     }
 
     private fun cleanupLocked() {
