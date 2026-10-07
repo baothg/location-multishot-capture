@@ -57,6 +57,14 @@ class Camera2Controller(
         val requiresMaximumResolution: Boolean,
     )
 
+    private data class ResourcesToClose(
+        val session: CameraCaptureSession?,
+        val device: CameraDevice?,
+        val imageReader: ImageReader?,
+        val previewSurface: Surface?,
+        val backgroundThread: HandlerThread?,
+    )
+
     private val cameraManager = context.getSystemService(CameraManager::class.java)
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
@@ -73,35 +81,55 @@ class Camera2Controller(
     private var backgroundHandler: Handler? = null
     @Volatile
     private var cameraOpenRequested = false
+    private var cameraGeneration = 0L
     private var useMaximumResolutionCapture = false
     @Volatile
     private var isStopped = true
     private val pendingJpegOrientations = ConcurrentLinkedQueue<Int>()
 
     fun start() {
-        isStopped = false
-        startBackgroundThread()
-        if (textureView.isAvailable) {
-            surfaceTexture = textureView.surfaceTexture
+        val surfaceAvailable = synchronized(this) {
+            isStopped = false
+            startBackgroundThread()
+            if (textureView.isAvailable) {
+                surfaceTexture = textureView.surfaceTexture
+                true
+            } else {
+                false
+            }
+        }
+        if (surfaceAvailable) {
             openCamera()
         }
     }
 
-    @Synchronized
     fun stop() {
-        isStopped = true
-        captureSession?.close()
-        captureSession = null
-        cameraDevice?.close()
-        cameraDevice = null
-        imageReader?.close()
-        imageReader = null
-        previewSurface?.release()
-        previewSurface = null
-        cameraOpenRequested = false
-        useMaximumResolutionCapture = false
-        pendingJpegOrientations.clear()
-        stopBackgroundThread()
+        val resources = synchronized(this) {
+            isStopped = true
+            cameraGeneration += 1
+            val resources = ResourcesToClose(
+                session = captureSession,
+                device = cameraDevice,
+                imageReader = imageReader,
+                previewSurface = previewSurface,
+                backgroundThread = backgroundThread,
+            )
+            captureSession = null
+            cameraDevice = null
+            imageReader = null
+            previewSurface = null
+            backgroundThread = null
+            backgroundHandler = null
+            cameraOpenRequested = false
+            useMaximumResolutionCapture = false
+            pendingJpegOrientations.clear()
+            resources
+        }
+        closeCaptureSession(resources.session)
+        closeCameraDevice(resources.device)
+        resources.imageReader?.close()
+        resources.previewSurface?.release()
+        stopBackgroundThread(resources.backgroundThread)
     }
 
     fun captureStillImage() {
@@ -157,6 +185,8 @@ class Camera2Controller(
                 backgroundHandler,
             )
         } catch (exception: CameraAccessException) {
+            failPendingImage()
+        } catch (exception: SecurityException) {
             failPendingImage()
         } catch (exception: IllegalStateException) {
             failPendingImage()
@@ -234,14 +264,17 @@ class Camera2Controller(
 
     @SuppressLint("MissingPermission")
     private fun openCamera() {
-        if (isStopped || cameraDevice != null || cameraOpenRequested ||
-            surfaceTexture == null
-        ) {
-            return
+        val requestGeneration = synchronized(this) {
+            if (isStopped || cameraDevice != null || cameraOpenRequested ||
+                surfaceTexture == null
+            ) {
+                return
+            }
+            cameraOpenRequested = true
+            ++cameraGeneration
         }
 
         try {
-            cameraOpenRequested = true
             val selectedCameraId = selectCamera()
             cameraId = selectedCameraId
             val characteristics = cameraManager.getCameraCharacteristics(selectedCameraId)
@@ -314,7 +347,7 @@ class Camera2Controller(
                 callback.onCameraError("CAMERA_UNAVAILABLE", "Camera không hỗ trợ preview.")
                 return
             }
-            imageReader = ImageReader.newInstance(
+            val reader = ImageReader.newInstance(
                 imageSize!!.width,
                 imageSize!!.height,
                 ImageFormat.JPEG,
@@ -322,114 +355,231 @@ class Camera2Controller(
             ).apply {
                 setOnImageAvailableListener(::onImageAvailable, backgroundHandler)
             }
-
+            val acceptedReader = synchronized(this) {
+                if (isStopped || cameraGeneration != requestGeneration) {
+                    false
+                } else {
+                    imageReader = reader
+                    true
+                }
+            }
+            if (!acceptedReader) {
+                reader.close()
+                return
+            }
             cameraManager.openCamera(
                 selectedCameraId,
                 object : CameraDevice.StateCallback() {
                     override fun onOpened(device: CameraDevice) {
-                        synchronized(this@Camera2Controller) {
-                            if (isStopped) {
+                        val accepted = synchronized(this@Camera2Controller) {
+                            if (isStopped || cameraGeneration != requestGeneration) {
+                                if (cameraGeneration == requestGeneration) {
+                                    cameraOpenRequested = false
+                                }
+                                false
+                            } else {
                                 cameraOpenRequested = false
-                                device.close()
-                                return
+                                cameraDevice = device
+                                true
                             }
-                            cameraDevice = device
                         }
-                        createPreviewSession()
+                        if (!accepted) {
+                            closeCameraDevice(device)
+                            return
+                        }
+                        createPreviewSession(device, requestGeneration)
                     }
 
                     override fun onDisconnected(device: CameraDevice) {
-                        cameraOpenRequested = false
-                        device.close()
-                        if (cameraDevice == device) {
-                            cameraDevice = null
+                        val wasCurrent = synchronized(this@Camera2Controller) {
+                            if (cameraGeneration != requestGeneration ||
+                                (cameraDevice !== device &&
+                                    (cameraDevice != null || !cameraOpenRequested)
+                                )
+                            ) {
+                                false
+                            } else {
+                                cameraOpenRequested = false
+                                if (cameraDevice === device) {
+                                    cameraDevice = null
+                                }
+                                true
+                            }
                         }
-                        callback.onCameraError(
-                            "CAMERA_UNAVAILABLE",
-                            "Camera đang được ứng dụng khác sử dụng.",
-                        )
+                        closeCameraDevice(device)
+                        if (wasCurrent && isCurrentGeneration(requestGeneration)) {
+                            callback.onCameraError(
+                                "CAMERA_UNAVAILABLE",
+                                "Camera đang được ứng dụng khác sử dụng.",
+                            )
+                        }
                     }
 
                     override fun onError(device: CameraDevice, error: Int) {
-                        cameraOpenRequested = false
-                        device.close()
-                        if (cameraDevice == device) {
-                            cameraDevice = null
+                        val wasCurrent = synchronized(this@Camera2Controller) {
+                            if (cameraGeneration != requestGeneration ||
+                                (cameraDevice !== device &&
+                                    (cameraDevice != null || !cameraOpenRequested)
+                                )
+                            ) {
+                                false
+                            } else {
+                                cameraOpenRequested = false
+                                if (cameraDevice === device) {
+                                    cameraDevice = null
+                                }
+                                true
+                            }
                         }
-                        callback.onCameraError("CAMERA_OPEN_FAILED", "Không thể mở camera.")
+                        closeCameraDevice(device)
+                        if (wasCurrent && isCurrentGeneration(requestGeneration)) {
+                            callback.onCameraError("CAMERA_OPEN_FAILED", "Không thể mở camera.")
+                        }
                     }
                 },
                 backgroundHandler,
             )
         } catch (exception: CameraAccessException) {
-            cameraOpenRequested = false
-            callback.onCameraError("CAMERA_UNAVAILABLE", "Không thể truy cập camera.")
+            val isCurrent = synchronized(this) {
+                if (cameraGeneration == requestGeneration) {
+                    cameraOpenRequested = false
+                    !isStopped
+                } else {
+                    false
+                }
+            }
+            if (isCurrent) {
+                callback.onCameraError("CAMERA_UNAVAILABLE", "Không thể truy cập camera.")
+            }
         } catch (exception: SecurityException) {
-            cameraOpenRequested = false
-            callback.onCameraError("CAMERA_PERMISSION_DENIED", "Thiếu quyền camera.")
+            val isCurrent = synchronized(this) {
+                if (cameraGeneration == requestGeneration) {
+                    cameraOpenRequested = false
+                    !isStopped
+                } else {
+                    false
+                }
+            }
+            if (isCurrent) {
+                callback.onCameraError("CAMERA_PERMISSION_DENIED", "Thiếu quyền camera.")
+            }
         }
     }
 
-    private fun createPreviewSession() {
-        val device = cameraDevice ?: return
+    private fun isCurrentGeneration(
+        requestGeneration: Long,
+        device: CameraDevice? = null,
+    ): Boolean {
+        return synchronized(this) {
+            !isStopped &&
+                cameraGeneration == requestGeneration &&
+                (device == null || cameraDevice === device)
+        }
+    }
+
+    private fun createPreviewSession(device: CameraDevice, requestGeneration: Long) {
+        if (!isCurrentGeneration(requestGeneration, device)) {
+            return
+        }
         val reader = imageReader ?: return
         val texture = surfaceTexture ?: return
         val size = previewSize ?: return
 
         try {
             texture.setDefaultBufferSize(size.width, size.height)
-            previewSurface?.release()
             val surface = Surface(texture)
-            previewSurface = surface
+            val acceptedSurface = synchronized(this) {
+                if (isStopped ||
+                    cameraGeneration != requestGeneration ||
+                    cameraDevice !== device
+                ) {
+                    false
+                } else {
+                    previewSurface?.release()
+                    previewSurface = surface
+                    true
+                }
+            }
+            if (!acceptedSurface) {
+                surface.release()
+                return
+            }
             val sessionCallback = object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(session: CameraCaptureSession) {
                     synchronized(this@Camera2Controller) {
-                        if (isStopped || cameraDevice == null) {
-                            session.close()
+                        if (isStopped ||
+                            cameraGeneration != requestGeneration ||
+                            cameraDevice !== device
+                        ) {
+                            closeCaptureSession(session)
                             return
                         }
                         captureSession = session
-                    }
-                    try {
-                        val requestBuilder =
-                            device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
-                        requestBuilder.addTarget(surface)
-                        requestBuilder.set(
-                            CaptureRequest.CONTROL_MODE,
-                            CaptureRequest.CONTROL_MODE_AUTO,
-                        )
-                        requestBuilder.set(
-                            CaptureRequest.CONTROL_AF_MODE,
-                            CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE,
-                        )
-                        if (useMaximumResolutionCapture &&
-                            Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
-                        ) {
+                        try {
+                            val requestBuilder =
+                                device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                            requestBuilder.addTarget(surface)
                             requestBuilder.set(
-                                CaptureRequest.SENSOR_PIXEL_MODE,
-                                CameraMetadata.SENSOR_PIXEL_MODE_DEFAULT,
+                                CaptureRequest.CONTROL_MODE,
+                                CaptureRequest.CONTROL_MODE_AUTO,
                             )
+                            requestBuilder.set(
+                                CaptureRequest.CONTROL_AF_MODE,
+                                CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE,
+                            )
+                            if (useMaximumResolutionCapture &&
+                                Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+                            ) {
+                                requestBuilder.set(
+                                    CaptureRequest.SENSOR_PIXEL_MODE,
+                                    CameraMetadata.SENSOR_PIXEL_MODE_DEFAULT,
+                                )
+                            }
+                            previewRequest = requestBuilder.build()
+                            session.setRepeatingRequest(
+                                previewRequest!!,
+                                null,
+                                backgroundHandler,
+                            )
+                            callback.onPreviewSizeChanged(size)
+                        } catch (exception: CameraAccessException) {
+                            if (!isStopped) {
+                                callback.onCameraError(
+                                    "CAMERA_OPEN_FAILED",
+                                    "Không thể khởi tạo preview camera.",
+                                )
+                            }
+                        } catch (_: SecurityException) {
+                            if (!isStopped) {
+                                callback.onCameraError(
+                                    "CAMERA_OPEN_FAILED",
+                                    "Không thể khởi tạo preview camera.",
+                                )
+                            }
+                        } catch (_: IllegalStateException) {
+                            if (!isStopped) {
+                                callback.onCameraError(
+                                    "CAMERA_OPEN_FAILED",
+                                    "Không thể khởi tạo preview camera.",
+                                )
+                            }
                         }
-                        previewRequest = requestBuilder.build()
-                        session.setRepeatingRequest(
-                            previewRequest!!,
-                            null,
-                            backgroundHandler,
-                        )
-                        callback.onPreviewSizeChanged(size)
-                    } catch (exception: CameraAccessException) {
-                        callback.onCameraError(
-                            "CAMERA_OPEN_FAILED",
-                            "Không thể khởi tạo preview camera.",
-                        )
                     }
                 }
 
                 override fun onConfigureFailed(session: CameraCaptureSession) {
-                    callback.onCameraError(
-                        "CAMERA_OPEN_FAILED",
-                        "Không thể khởi tạo camera session.",
-                    )
+                    val isCurrent = synchronized(this@Camera2Controller) {
+                        !isStopped &&
+                            cameraGeneration == requestGeneration &&
+                            cameraDevice === device
+                    }
+                    closeCaptureSession(session)
+                    if (isCurrent && isCurrentGeneration(requestGeneration, device)) {
+                        callback.onCameraError(
+                            "CAMERA_OPEN_FAILED",
+                            "Không thể khởi tạo camera session.",
+                        )
+                    }
                 }
             }
 
@@ -463,7 +613,17 @@ class Camera2Controller(
                 )
             }
         } catch (exception: CameraAccessException) {
-            callback.onCameraError("CAMERA_OPEN_FAILED", "Không thể khởi tạo camera.")
+            if (isCurrentGeneration(requestGeneration, device)) {
+                callback.onCameraError("CAMERA_OPEN_FAILED", "Không thể khởi tạo camera.")
+            }
+        } catch (_: SecurityException) {
+            if (isCurrentGeneration(requestGeneration, device)) {
+                callback.onCameraError("CAMERA_OPEN_FAILED", "Không thể khởi tạo camera.")
+            }
+        } catch (_: IllegalStateException) {
+            if (isCurrentGeneration(requestGeneration, device)) {
+                callback.onCameraError("CAMERA_OPEN_FAILED", "Không thể khởi tạo camera.")
+            }
         }
     }
 
@@ -579,6 +739,28 @@ class Camera2Controller(
         return getRelativeRotation()
     }
 
+    private fun closeCaptureSession(session: CameraCaptureSession?) {
+        if (session == null) {
+            return
+        }
+        try {
+            session.close()
+        } catch (_: SecurityException) {
+        } catch (_: IllegalStateException) {
+        }
+    }
+
+    private fun closeCameraDevice(device: CameraDevice?) {
+        if (device == null) {
+            return
+        }
+        try {
+            device.close()
+        } catch (_: SecurityException) {
+        } catch (_: IllegalStateException) {
+        }
+    }
+
     private fun startBackgroundThread() {
         if (backgroundThread != null) {
             return
@@ -589,15 +771,13 @@ class Camera2Controller(
         }
     }
 
-    private fun stopBackgroundThread() {
-        backgroundThread?.quitSafely()
+    private fun stopBackgroundThread(thread: HandlerThread?) {
+        thread?.quitSafely()
         try {
-            backgroundThread?.join(500)
+            thread?.join(500)
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
         }
-        backgroundThread = null
-        backgroundHandler = null
     }
 
     private companion object {
