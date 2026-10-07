@@ -27,7 +27,6 @@ import android.view.WindowManager
 import android.window.OnBackInvokedDispatcher
 import android.widget.FrameLayout
 import android.widget.ImageButton
-import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
@@ -60,6 +59,11 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
         val distanceToTargetMeters: Float? = null,
     )
 
+    private data class LocationErrorPrompt(
+        val captureIds: List<String>,
+        val message: String,
+    )
+
     private lateinit var config: NativeCameraConfig
     private lateinit var repository: ImageFileRepository
     private lateinit var locationService: LocationValidationService
@@ -74,13 +78,14 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
     private lateinit var confirmContainer: FrameLayout
     private lateinit var countBadge: TextView
     private lateinit var captureProgress: ProgressBar
-    private lateinit var loadingOverlay: FrameLayout
     private var cameraController: Camera2Controller? = null
     private var isLocationWarmupInProgress = false
     private var inFlightCaptures = 0
     private var lastShutterTapElapsedMs = 0L
 
     private val captures = linkedMapOf<String, CaptureRecord>()
+    private val locationErrorPrompts = mutableListOf<LocationErrorPrompt>()
+    private var locationErrorDialogShowing = false
     private var resultDelivered = false
     private var permissionDialogShowing = false
     private var waitingForPermissionResult = false
@@ -519,46 +524,6 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
             ),
         )
 
-        val loadingContent = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-        }
-        loadingContent.addView(
-            ProgressBar(this).apply { isIndeterminate = true },
-        )
-        loadingContent.addView(
-            TextView(this).apply {
-                text = "Đang kiểm tra vị trí…"
-                setTextColor(Color.WHITE)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-                gravity = Gravity.CENTER
-            },
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-            ).apply { topMargin = dp(16) },
-        )
-        loadingOverlay = FrameLayout(this).apply {
-            setBackgroundColor(0xB3000000.toInt())
-            isClickable = true
-            isFocusable = true
-            visibility = View.GONE
-        }
-        loadingOverlay.addView(
-            loadingContent,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-            ).apply { gravity = Gravity.CENTER },
-        )
-        rootLayout.addView(
-            loadingOverlay,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT,
-            ),
-        )
-
         setContentView(rootLayout)
         rootLayout.setOnApplyWindowInsetsListener { _, insets ->
             systemInsetLeft = insets.systemWindowInsetLeft
@@ -611,15 +576,15 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
             return
         }
         isLocationWarmupInProgress = true
-        loadingOverlay.visibility = View.VISIBLE
-        updateCaptureUi()
         locationService.warmupLocation { result ->
             if (isFinishing || resultDelivered) {
                 return@warmupLocation
             }
             isLocationWarmupInProgress = false
-            loadingOverlay.visibility = View.GONE
             updateCaptureUi()
+            if (result.captureIds.isNotEmpty() || captures.isNotEmpty() || inFlightCaptures > 0) {
+                return@warmupLocation
+            }
             if (result.location == null || !result.isValid) {
                 showLocationWarmupError(result)
             }
@@ -631,8 +596,10 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
     ) {
         val distanceMessage = result.distanceToTargetMeters
             ?.let { distance ->
-                "Bạn đang đứng cách vị trí cho phép ${formatDistance(distance)}. " +
-                    "Vui lòng di chuyển vào phạm vi cho phép rồi thử lại."
+                inaccurateLocationMessage(result) ?: (
+                    "Bạn đang đứng cách vị trí cho phép ${formatDistance(distance)}. " +
+                        "Vui lòng di chuyển vào phạm vi cho phép rồi thử lại."
+                    )
             }
         val locationError = result.errorMessage
             ?: "Thiếu tọa độ vị trí hiện tại để đối chiếu với vị trí cho phép."
@@ -647,18 +614,14 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
             )
             .setMessage(message)
             .setCancelable(false)
-            .setNegativeButton("Đóng") { _, _ -> finishCancelled() }
+            .setPositiveButton("Thử lại") { _, _ -> startLocationWarmup() }
+            .setNegativeButton("Tiếp tục") { dialog, _ -> dialog.dismiss() }
             .show()
             .also(::styleDialogButtons)
     }
 
     private fun onShutterClicked() {
-        if (isLocationWarmupInProgress) {
-            return
-        }
-        if (inFlightCaptures > 0 ||
-            captures.values.any { it.status == CaptureStatus.PENDING_LOCATION }
-        ) {
+        if (inFlightCaptures > 0) {
             return
         }
         val now = SystemClock.elapsedRealtime()
@@ -731,15 +694,17 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
         }
 
         if (!result.isValid || result.location == null) {
-            records.forEach { record ->
-                captures.remove(record.id)
-                repository.discard(record.file)
-            }
             updateCaptureUi()
             val message = result.distanceToTargetMeters?.let { distance ->
-                "Bạn đang đứng cách vị trí cho phép ${formatDistance(distance)}."
-            } ?: (result.errorMessage ?: "Không xác định được vị trí. Ảnh không được ghi nhận.")
-            showInfoDialog("Vị trí không hợp lệ", message)
+                inaccurateLocationMessage(result) ?: (
+                    "Bạn đang đứng cách vị trí cho phép ${formatDistance(distance)}. " +
+                        "Phạm vi cho phép là ${formatDistance(config.targetRadiusMeters!!.toFloat())}."
+                    )
+            } ?: (result.errorMessage ?: "Không xác định được vị trí hiện tại.")
+            locationErrorPrompts.add(
+                LocationErrorPrompt(records.map { it.id }, message),
+            )
+            showNextLocationErrorPrompt()
             return
         }
 
@@ -761,9 +726,9 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
         val isProcessing = inFlightCaptures > 0 ||
             captures.values.any { it.status == CaptureStatus.PENDING_LOCATION }
 
-        shutterButton.isEnabled = !isLocationWarmupInProgress && !isProcessing
+        shutterButton.isEnabled = inFlightCaptures == 0
         shutterButton.alpha = if (shutterButton.isEnabled) 1f else 0.45f
-        shutterProgress.visibility = if (isProcessing) View.VISIBLE else View.GONE
+        shutterProgress.visibility = if (inFlightCaptures > 0) View.VISIBLE else View.GONE
 
         confirmButton.isEnabled = !isProcessing && captures.isNotEmpty() &&
             captures.values.all {
@@ -862,6 +827,39 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
             .also(::styleDialogButtons)
     }
 
+    private fun showNextLocationErrorPrompt() {
+        if (locationErrorDialogShowing || isFinishing || locationErrorPrompts.isEmpty()) {
+            return
+        }
+        val prompt = locationErrorPrompts.removeAt(0)
+        val captureIds = prompt.captureIds.filter(captures::containsKey)
+        if (captureIds.isEmpty()) {
+            rootLayout.post { showNextLocationErrorPrompt() }
+            return
+        }
+        locationErrorDialogShowing = true
+        val dialog = materialDialogBuilder()
+            .setTitle("Vị trí không hợp lệ")
+            .setMessage(prompt.message)
+            .setCancelable(false)
+            .setPositiveButton("Thử lại") { _, _ ->
+                locationService.retryCaptures(captureIds)
+            }
+            .setNegativeButton("Bỏ ảnh") { _, _ ->
+                captureIds.mapNotNull(captures::get).forEach { record ->
+                    captures.remove(record.id)
+                    repository.discard(record.file)
+                }
+                updateCaptureUi()
+            }
+            .show()
+        dialog.setOnDismissListener {
+            locationErrorDialogShowing = false
+            rootLayout.post { showNextLocationErrorPrompt() }
+        }
+        styleDialogButtons(dialog)
+    }
+
     private fun showInfoDialog(title: String, message: String) {
         if (isFinishing) {
             return
@@ -920,6 +918,14 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
         } else {
             arrayOf(Manifest.permission.CAMERA)
         }
+    }
+
+    private fun inaccurateLocationMessage(
+        result: LocationValidationService.LocationValidationResult,
+    ): String? {
+        val message = result.errorMessage ?: return null
+        val accuracy = result.locationAccuracyMeters ?: return message
+        return "$message Sai số ước tính ±${formatDistance(accuracy)}."
     }
 
     private fun formatDistance(distanceMeters: Float): String {
