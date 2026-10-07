@@ -596,10 +596,8 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
     ) {
         val distanceMessage = result.distanceToTargetMeters
             ?.let { distance ->
-                inaccurateLocationMessage(result) ?: (
-                    "Bạn đang đứng cách vị trí cho phép ${formatDistance(distance)}. " +
-                        "Vui lòng di chuyển vào phạm vi cho phép rồi thử lại."
-                    )
+                "Bạn đang đứng cách vị trí cho phép ${formatDistance(distance)}. " +
+                    "Vui lòng di chuyển vào phạm vi cho phép rồi thử lại."
             }
         val locationError = result.errorMessage
             ?: "Thiếu tọa độ vị trí hiện tại để đối chiếu với vị trí cho phép."
@@ -608,16 +606,10 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
                 "Hãy kiểm tra quyền truy cập vị trí chính xác, bật dịch vụ Vị trí/GPS " +
                 "và kết nối Wi-Fi hoặc dữ liệu di động rồi thử lại."
             )
-        materialDialogBuilder()
-            .setTitle(
-                if (distanceMessage != null) "Vị trí không hợp lệ" else "Thiếu thông tin định vị",
-            )
-            .setMessage(message)
-            .setCancelable(false)
-            .setPositiveButton("Thử lại") { _, _ -> startLocationWarmup() }
-            .setNegativeButton("Tiếp tục") { dialog, _ -> dialog.dismiss() }
-            .show()
-            .also(::styleDialogButtons)
+        showLocationValidationDialog(
+            message = message,
+            onRetry = { startLocationWarmup() },
+        )
     }
 
     private fun onShutterClicked() {
@@ -696,10 +688,8 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
         if (!result.isValid || result.location == null) {
             updateCaptureUi()
             val message = result.distanceToTargetMeters?.let { distance ->
-                inaccurateLocationMessage(result) ?: (
-                    "Bạn đang đứng cách vị trí cho phép ${formatDistance(distance)}. " +
-                        "Phạm vi cho phép là ${formatDistance(config.targetRadiusMeters!!.toFloat())}."
-                    )
+                "Bạn đang đứng cách vị trí cho phép ${formatDistance(distance)}. " +
+                    "Phạm vi cho phép là ${formatDistance(config.targetRadiusMeters!!.toFloat())}."
             } ?: (result.errorMessage ?: "Không xác định được vị trí hiện tại.")
             locationErrorPrompts.add(
                 LocationErrorPrompt(records.map { it.id }, message),
@@ -827,6 +817,22 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
             .also(::styleDialogButtons)
     }
 
+    private fun showLocationValidationDialog(
+        message: String,
+        onRetry: () -> Unit,
+        onDismiss: (() -> Unit)? = null,
+    ) {
+        val dialog = materialDialogBuilder()
+            .setTitle("Vị trí không hợp lệ")
+            .setMessage(message)
+            .setCancelable(false)
+            .setPositiveButton("Thử lại") { _, _ -> onRetry() }
+            .setNegativeButton("Đóng") { _, _ -> finishCancelled() }
+            .show()
+        dialog.setOnDismissListener { onDismiss?.invoke() }
+        styleDialogButtons(dialog)
+    }
+
     private fun showNextLocationErrorPrompt() {
         if (locationErrorDialogShowing || isFinishing || locationErrorPrompts.isEmpty()) {
             return
@@ -838,26 +844,14 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
             return
         }
         locationErrorDialogShowing = true
-        val dialog = materialDialogBuilder()
-            .setTitle("Vị trí không hợp lệ")
-            .setMessage(prompt.message)
-            .setCancelable(false)
-            .setPositiveButton("Thử lại") { _, _ ->
-                locationService.retryCaptures(captureIds)
-            }
-            .setNegativeButton("Bỏ ảnh") { _, _ ->
-                captureIds.mapNotNull(captures::get).forEach { record ->
-                    captures.remove(record.id)
-                    repository.discard(record.file)
-                }
-                updateCaptureUi()
-            }
-            .show()
-        dialog.setOnDismissListener {
-            locationErrorDialogShowing = false
-            rootLayout.post { showNextLocationErrorPrompt() }
-        }
-        styleDialogButtons(dialog)
+        showLocationValidationDialog(
+            message = prompt.message,
+            onRetry = { locationService.retryCaptures(captureIds) },
+            onDismiss = {
+                locationErrorDialogShowing = false
+                rootLayout.post { showNextLocationErrorPrompt() }
+            },
+        )
     }
 
     private fun showInfoDialog(title: String, message: String) {
@@ -918,14 +912,6 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
         } else {
             arrayOf(Manifest.permission.CAMERA)
         }
-    }
-
-    private fun inaccurateLocationMessage(
-        result: LocationValidationService.LocationValidationResult,
-    ): String? {
-        val message = result.errorMessage ?: return null
-        val accuracy = result.locationAccuracyMeters ?: return message
-        return "$message Sai số ước tính ±${formatDistance(accuracy)}."
     }
 
     private fun formatDistance(distanceMeters: Float): String {

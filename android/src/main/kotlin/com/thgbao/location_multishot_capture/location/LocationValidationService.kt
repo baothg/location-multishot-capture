@@ -21,7 +21,6 @@ class LocationValidationService(
         val captureIds: List<String>,
         val location: Location?,
         val distanceToTargetMeters: Float?,
-        val locationAccuracyMeters: Float?,
         val isValid: Boolean,
         val errorMessage: String?,
     )
@@ -311,20 +310,12 @@ class LocationValidationService(
             longitude = targetLongitude
         }
         val distance = location.distanceTo(target)
-        val isConfidentlyWithinTarget = distance + location.accuracy <= targetRadiusMeters
-        val isAmbiguous = distance - location.accuracy <= targetRadiusMeters &&
-            !isConfidentlyWithinTarget
         return LocationValidationResult(
             captureIds = captureIds,
             location = location,
             distanceToTargetMeters = distance,
-            locationAccuracyMeters = location.accuracy,
-            isValid = isConfidentlyWithinTarget,
-            errorMessage = if (isAmbiguous) {
-                "Độ chính xác vị trí chưa đủ để xác nhận bạn đang trong phạm vi cho phép."
-            } else {
-                null
-            },
+            isValid = distance <= targetRadiusMeters,
+            errorMessage = null,
         )
     }
 
@@ -336,7 +327,6 @@ class LocationValidationService(
             captureIds = acquisition.captureId?.let(::listOf) ?: emptyList(),
             location = null,
             distanceToTargetMeters = null,
-            locationAccuracyMeters = null,
             isValid = false,
             errorMessage = errorMessage,
         )
