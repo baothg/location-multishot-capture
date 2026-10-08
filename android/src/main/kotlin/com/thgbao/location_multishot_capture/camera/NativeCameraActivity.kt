@@ -57,11 +57,7 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
         val latitude: Double? = null,
         val longitude: Double? = null,
         val distanceToTargetMeters: Float? = null,
-    )
-
-    private data class LocationErrorPrompt(
-        val captureIds: List<String>,
-        val message: String,
+        val locationTimestamp: Long? = null,
     )
 
     private lateinit var config: NativeCameraConfig
@@ -79,13 +75,11 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
     private lateinit var countBadge: TextView
     private lateinit var captureProgress: ProgressBar
     private var cameraController: Camera2Controller? = null
-    private var isLocationWarmupInProgress = false
     private var inFlightCaptures = 0
     private var lastShutterTapElapsedMs = 0L
 
     private val captures = linkedMapOf<String, CaptureRecord>()
-    private val locationErrorPrompts = mutableListOf<LocationErrorPrompt>()
-    private var locationErrorDialogShowing = false
+    private var locationFailureDialogShowing = false
     private var resultDelivered = false
     private var permissionDialogShowing = false
     private var waitingForPermissionResult = false
@@ -100,7 +94,11 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         config = NativeCameraConfig.from(intent)
-        if (config.remainingImageCount <= 0 || config.hasPartialTarget) {
+        if (config.remainingImageCount <= 0 ||
+            config.hasPartialTarget ||
+            config.hasPartialInitialLocation ||
+            (config.hasLocationTarget && !config.hasValidInitialLocation)
+        ) {
             finishWithError(
                 "INVALID_CAMERA_CONFIG",
                 "Cấu hình camera không hợp lệ.",
@@ -116,6 +114,8 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
                 targetLatitude = config.targetLatitude!!,
                 targetLongitude = config.targetLongitude!!,
                 targetRadiusMeters = config.targetRadiusMeters!!,
+                initialLatitude = config.initialLatitude!!,
+                initialLongitude = config.initialLongitude!!,
                 callback = ::onLocationValidationResult,
             )
         }
@@ -130,10 +130,6 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
         if (!hasRequiredPermissions()) {
             waitingForPermissionResult = true
             requestPermissions(requiredPermissions(), REQUEST_PERMISSIONS)
-        } else if (!isLocationServiceReady()) {
-            showRequiredPermissionDialog("Vui lòng bật dịch vụ vị trí để chụp ảnh.")
-        } else {
-            startLocationWarmup()
         }
     }
 
@@ -144,26 +140,20 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
             return
         }
         if (!hasRequiredPermissions()) {
-            showRequiredPermissionDialog(
-                "Ứng dụng cần quyền camera và vị trí để chụp ảnh.",
-            )
-            return
-        }
-        if (!isLocationServiceReady()) {
-            showRequiredPermissionDialog("Vui lòng bật dịch vụ vị trí để chụp ảnh.")
+            showRequiredPermissionDialog("Ứng dụng cần quyền camera để chụp ảnh.")
             return
         }
         cameraController?.start()
-    }
-
-    private fun isLocationServiceReady(): Boolean {
-        return !config.hasLocationTarget ||
-            (::locationService.isInitialized &&
-                locationService.isLocationServiceEnabled())
+        if (::locationService.isInitialized) {
+            locationService.startPeriodicUpdates()
+        }
     }
 
     override fun onPause() {
         cameraController?.stop()
+        if (::locationService.isInitialized) {
+            locationService.stopPeriodicUpdates()
+        }
         inFlightCaptures = 0
         if (::countBadge.isInitialized) {
             updateCaptureUi()
@@ -301,17 +291,13 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
         waitingForPermissionResult = false
 
         if (!hasRequiredPermissions()) {
-            showRequiredPermissionDialog(
-                "Ứng dụng cần quyền camera và vị trí để chụp ảnh.",
-            )
-            return
-        }
-        if (!isLocationServiceReady()) {
-            showRequiredPermissionDialog("Vui lòng bật dịch vụ vị trí để chụp ảnh.")
+            showRequiredPermissionDialog("Ứng dụng cần quyền camera để chụp ảnh.")
             return
         }
         cameraController?.start()
-        startLocationWarmup()
+        if (::locationService.isInitialized) {
+            locationService.startPeriodicUpdates()
+        }
     }
 
     @Deprecated("Deprecated in Java")
@@ -571,47 +557,6 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
         }
     }
 
-    private fun startLocationWarmup() {
-        if (!config.hasLocationTarget || isLocationWarmupInProgress) {
-            return
-        }
-        isLocationWarmupInProgress = true
-        locationService.warmupLocation { result ->
-            if (isFinishing || resultDelivered) {
-                return@warmupLocation
-            }
-            isLocationWarmupInProgress = false
-            updateCaptureUi()
-            if (result.captureIds.isNotEmpty() || captures.isNotEmpty() || inFlightCaptures > 0) {
-                return@warmupLocation
-            }
-            if (result.location == null || !result.isValid) {
-                showLocationWarmupError(result)
-            }
-        }
-    }
-
-    private fun showLocationWarmupError(
-        result: LocationValidationService.LocationValidationResult,
-    ) {
-        val distanceMessage = result.distanceToTargetMeters
-            ?.let { distance ->
-                "Bạn đang đứng cách vị trí cho phép ${formatDistance(distance)}. " +
-                    "Vui lòng di chuyển vào phạm vi cho phép rồi thử lại."
-            }
-        val locationError = result.errorMessage
-            ?: "Thiếu tọa độ vị trí hiện tại để đối chiếu với vị trí cho phép."
-        val message = distanceMessage ?: (
-            "$locationError\n\n" +
-                "Hãy kiểm tra quyền truy cập vị trí chính xác, bật dịch vụ Vị trí/GPS " +
-                "và kết nối Wi-Fi hoặc dữ liệu di động rồi thử lại."
-            )
-        showLocationValidationDialog(
-            message = message,
-            onRetry = { startLocationWarmup() },
-        )
-    }
-
     private fun onShutterClicked() {
         if (inFlightCaptures > 0) {
             return
@@ -677,7 +622,7 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
     private fun onLocationValidationResult(
         result: LocationValidationService.LocationValidationResult,
     ) {
-        if (isFinishing || resultDelivered) {
+        if (isFinishing || resultDelivered || locationFailureDialogShowing) {
             return
         }
         val records = result.captureIds.mapNotNull(captures::get)
@@ -686,15 +631,19 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
         }
 
         if (!result.isValid || result.location == null) {
-            updateCaptureUi()
-            val message = result.distanceToTargetMeters?.let { distance ->
-                "Bạn đang đứng cách vị trí cho phép ${formatDistance(distance)}. " +
-                    "Phạm vi cho phép là ${formatDistance(config.targetRadiusMeters!!.toFloat())}."
-            } ?: (result.errorMessage ?: "Không xác định được vị trí hiện tại.")
-            locationErrorPrompts.add(
-                LocationErrorPrompt(records.map { it.id }, message),
-            )
-            showNextLocationErrorPrompt()
+            val errorCode = if (result.location == null) {
+                "LOCATION_UNAVAILABLE"
+            } else {
+                "LOCATION_VALIDATION_FAILED"
+            }
+            val message = if (result.location == null) {
+                result.errorMessage ?: "Không lấy được thông tin vị trí của bạn. Hãy kiểm tra định vị và thử lại"
+            } else {
+                result.distanceToTargetMeters?.let { distance ->
+                    "Bạn đang ở ngoài phạm vi cho phép, cách ${formatDistance(distance)}."
+                } ?: "Không xác định được khoảng cách đến vị trí cho phép."
+            }
+            showLocationFailureDialog(message, errorCode)
             return
         }
 
@@ -704,6 +653,7 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
                 latitude = result.location.latitude,
                 longitude = result.location.longitude,
                 distanceToTargetMeters = result.distanceToTargetMeters,
+                locationTimestamp = result.locationCapturedAtMillis,
             )
         }
         updateCaptureUi()
@@ -751,6 +701,7 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
                         .put("timestamp", capture.timestamp)
                         .put("latitude", capture.latitude ?: JSONObject.NULL)
                         .put("longitude", capture.longitude ?: JSONObject.NULL)
+                        .put("locationTimestamp", capture.locationTimestamp ?: JSONObject.NULL)
                         .put(
                             "distanceToTargetMeters",
                             capture.distanceToTargetMeters ?: JSONObject.NULL,
@@ -817,41 +768,21 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
             .also(::styleDialogButtons)
     }
 
-    private fun showLocationValidationDialog(
-        message: String,
-        onRetry: () -> Unit,
-        onDismiss: (() -> Unit)? = null,
-    ) {
-        val dialog = materialDialogBuilder()
-            .setTitle("Vị trí không hợp lệ")
+    private fun showLocationFailureDialog(message: String, errorCode: String) {
+        if (locationFailureDialogShowing || isFinishing || resultDelivered) {
+            return
+        }
+        locationFailureDialogShowing = true
+        if (::locationService.isInitialized) {
+            locationService.cancelAll()
+        }
+        materialDialogBuilder()
+            .setTitle("Không thể xác thực vị trí")
             .setMessage(message)
             .setCancelable(false)
-            .setPositiveButton("Thử lại") { _, _ -> onRetry() }
-            .setNegativeButton("Đóng") { _, _ -> finishCancelled() }
+            .setPositiveButton("Đóng") { _, _ -> finishWithError(errorCode, message) }
             .show()
-        dialog.setOnDismissListener { onDismiss?.invoke() }
-        styleDialogButtons(dialog)
-    }
-
-    private fun showNextLocationErrorPrompt() {
-        if (locationErrorDialogShowing || isFinishing || locationErrorPrompts.isEmpty()) {
-            return
-        }
-        val prompt = locationErrorPrompts.removeAt(0)
-        val captureIds = prompt.captureIds.filter(captures::containsKey)
-        if (captureIds.isEmpty()) {
-            rootLayout.post { showNextLocationErrorPrompt() }
-            return
-        }
-        locationErrorDialogShowing = true
-        showLocationValidationDialog(
-            message = prompt.message,
-            onRetry = { locationService.retryCaptures(captureIds) },
-            onDismiss = {
-                locationErrorDialogShowing = false
-                rootLayout.post { showNextLocationErrorPrompt() }
-            },
-        )
+            .also(::styleDialogButtons)
     }
 
     private fun showInfoDialog(title: String, message: String) {
@@ -894,24 +825,12 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
     }
 
     private fun hasRequiredPermissions(): Boolean {
-        val cameraGranted = checkSelfPermission(Manifest.permission.CAMERA) ==
+        return checkSelfPermission(Manifest.permission.CAMERA) ==
             PackageManager.PERMISSION_GRANTED
-        val locationGranted = !config.hasLocationTarget ||
-            checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) ==
-                PackageManager.PERMISSION_GRANTED
-        return cameraGranted && locationGranted
     }
 
     private fun requiredPermissions(): Array<String> {
-        return if (config.hasLocationTarget) {
-            arrayOf(
-                Manifest.permission.CAMERA,
-                Manifest.permission.ACCESS_FINE_LOCATION,
-                Manifest.permission.ACCESS_COARSE_LOCATION,
-            )
-        } else {
-            arrayOf(Manifest.permission.CAMERA)
-        }
+        return arrayOf(Manifest.permission.CAMERA)
     }
 
     private fun formatDistance(distanceMeters: Float): String {

@@ -12,6 +12,8 @@ class CameraConfig {
     this.targetLatitude,
     this.targetLongitude,
     this.targetRadiusMeters,
+    this.initialLatitude,
+    this.initialLongitude,
     this.maxMegapixels = 0x7fffffff,
   });
 
@@ -32,6 +34,10 @@ class CameraConfig {
   /// Allowed radius around the target, in meters.
   final double? targetRadiusMeters;
 
+  final double? initialLatitude;
+
+  final double? initialLongitude;
+
   /// Optional cap for captured JPEG resolution.
   final int maxMegapixels;
 
@@ -45,6 +51,8 @@ class CameraConfig {
       'targetLatitude': ?targetLatitude,
       'targetLongitude': ?targetLongitude,
       'targetRadiusMeters': ?targetRadiusMeters,
+      'initialLatitude': ?initialLatitude,
+      'initialLongitude': ?initialLongitude,
     };
   }
 }

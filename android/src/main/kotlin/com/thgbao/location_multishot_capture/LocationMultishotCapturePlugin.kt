@@ -137,6 +137,12 @@ class LocationMultishotCapturePlugin :
         arguments.doubleOrNull("targetRadiusMeters")?.let {
             intent.putExtra(NativeCameraConfig.EXTRA_TARGET_RADIUS_METERS, it)
         }
+        arguments.doubleOrNull("initialLatitude")?.let {
+            intent.putExtra(NativeCameraConfig.EXTRA_INITIAL_LATITUDE, it)
+        }
+        arguments.doubleOrNull("initialLongitude")?.let {
+            intent.putExtra(NativeCameraConfig.EXTRA_INITIAL_LONGITUDE, it)
+        }
         intent.putExtra(
             NativeCameraConfig.EXTRA_MAX_MEGAPIXELS,
             arguments.intValue("maxMegapixels", Int.MAX_VALUE),

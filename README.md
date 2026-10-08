@@ -31,6 +31,8 @@ final result = await const LocationMultishotCapture().openCamera(
     targetLatitude: 10.0,
     targetLongitude: 106.0,
     targetRadiusMeters: 50000,
+    initialLatitude: 10.0,
+    initialLongitude: 106.0,
   ),
 );
 

@@ -36,6 +36,19 @@ void main() {
     expect(config.remainingImageCount, 2);
   });
 
+  test('CameraConfig sends the initial user location to native code', () {
+    const config = CameraConfig(
+      targetLatitude: 10,
+      targetLongitude: 106,
+      targetRadiusMeters: 100,
+      initialLatitude: 10.1,
+      initialLongitude: 106.1,
+    );
+
+    expect(config.toMap()['initialLatitude'], 10.1);
+    expect(config.toMap()['initialLongitude'], 106.1);
+  });
+
   test('CameraResult parses confirmed native images', () {
     final result = CameraResult.fromMap({
       'status': 'confirmed',
@@ -50,6 +63,7 @@ void main() {
           'latitude': 10.1,
           'longitude': 106.2,
           'distanceToTargetMeters': 15.5,
+          'locationTimestamp': 123456700,
         },
       ],
     });
@@ -58,6 +72,10 @@ void main() {
     expect(result.images, hasLength(1));
     expect(result.images.single.id, 'image-1');
     expect(result.images.single.distanceToTargetMeters, 15.5);
+    expect(
+      result.images.single.locationCapturedAt,
+      DateTime.fromMillisecondsSinceEpoch(123456700),
+    );
   });
 
   test('SessionImageStore deletes the backing file', () async {

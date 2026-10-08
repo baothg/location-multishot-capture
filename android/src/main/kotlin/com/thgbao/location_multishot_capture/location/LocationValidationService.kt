@@ -9,350 +9,380 @@ import android.location.LocationManager
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import com.google.android.gms.tasks.CancellationTokenSource
+import com.google.android.gms.location.CurrentLocationRequest
+import com.google.android.gms.location.LocationCallback
+import com.google.android.gms.location.LocationRequest
+import com.google.android.gms.location.LocationResult
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
 
 class LocationValidationService(
     context: Context,
     private val targetLatitude: Double,
     private val targetLongitude: Double,
     private val targetRadiusMeters: Double,
+    initialLatitude: Double,
+    initialLongitude: Double,
     private val callback: (LocationValidationResult) -> Unit,
 ) {
     data class LocationValidationResult(
         val captureIds: List<String>,
         val location: Location?,
+        val locationCapturedAtMillis: Long?,
         val distanceToTargetMeters: Float?,
         val isValid: Boolean,
         val errorMessage: String?,
     )
 
-    private data class Acquisition(
-        val captureId: String?,
-        val startedElapsedMs: Long,
-        val startedElapsedRealtimeNanos: Long,
-        var bestLocation: Location? = null,
-        var timeoutRunnable: Runnable? = null,
+    private data class CachedLocation(
+        val location: Location,
+        val recordedAtMillis: Long,
     )
 
     private val appContext = context.applicationContext
-    private val locationManager = appContext.getSystemService(LocationManager::class.java)
+    private val locationManager: LocationManager? =
+        appContext.getSystemService(LocationManager::class.java)
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val lock = Any()
-    private val captureAcquisitions = linkedMapOf<String, Acquisition>()
-    private val activeListeners = mutableListOf<LocationListener>()
-    private var locationUpdatesRegistered = false
-    private var warmupAcquisition: Acquisition? = null
-    private var warmupCallback: ((LocationValidationResult) -> Unit)? = null
-    private var cachedValidLocation: Location? = null
-
-    fun isLocationServiceEnabled(): Boolean {
-        return locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER) ||
-            locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
+    private val target = LocationCoordinates(targetLatitude, targetLongitude)
+    private val fusedLocationClient by lazy {
+        LocationServices.getFusedLocationProviderClient(appContext)
     }
+    private val initialRecordedAtMillis = System.currentTimeMillis()
+    private var primaryLocation = CachedLocation(
+        Location("flutter-initial").apply {
+            latitude = initialLatitude
+            longitude = initialLongitude
+            time = initialRecordedAtMillis
+        },
+        initialRecordedAtMillis,
+    )
+    private var secondLocation: CachedLocation? = null
+    private var periodicLocationCallback: LocationCallback? = null
+    private val periodicLocationListeners = mutableListOf<LocationListener>()
+    private val pendingCaptureIds = linkedSetOf<String>()
+    private val validatingCaptureIds = linkedSetOf<String>()
+    private var locationUpdatesStarted = false
+    private var lastChanceInProgress = false
+    private var lastChanceStartedElapsedRealtimeNanos = 0L
+    private var lastChanceCancellationToken: CancellationTokenSource? = null
+    private val lastChanceListeners = mutableListOf<LocationListener>()
+    private var lastChanceTimeout: Runnable? = null
+    private var disposed = false
 
-    fun warmupLocation(callback: (LocationValidationResult) -> Unit) {
-        synchronized(lock) {
-            warmupCallback = callback
-            if (warmupAcquisition == null) {
-                startAcquisitionLocked(captureId = null)
-            }
-        }
-    }
-
-    fun validateCapture(captureId: String) {
-        synchronized(lock) {
-            if (captureAcquisitions[captureId] != null) {
-                return
-            }
-            val cachedLocation = getCachedValidLocationLocked()
-            if (cachedLocation != null) {
-                complete(toResult(listOf(captureId), cachedLocation))
-            } else {
-                startAcquisitionLocked(captureId)
-            }
-        }
-    }
-
-    fun retryCaptures(captureIds: Collection<String>) {
-        synchronized(lock) {
-            cachedValidLocation = null
-            captureIds.forEach { captureId ->
-                cancelAcquisitionLocked(captureAcquisitions.remove(captureId))
-                startAcquisitionLocked(captureId)
-            }
-        }
-    }
-
-    fun cancelAll() {
-        synchronized(lock) {
-            captureAcquisitions.values.forEach(::removeTimeoutLocked)
-            captureAcquisitions.clear()
-            warmupAcquisition?.let(::removeTimeoutLocked)
-            warmupAcquisition = null
-            warmupCallback = null
-            cachedValidLocation = null
-            cleanupLocationUpdatesLocked()
-        }
-    }
-
-    private fun startAcquisitionLocked(captureId: String?) {
-        val acquisition = Acquisition(
-            captureId = captureId,
-            startedElapsedMs = SystemClock.elapsedRealtime(),
-            startedElapsedRealtimeNanos = SystemClock.elapsedRealtimeNanos(),
-        )
-        if (captureId == null) {
-            warmupAcquisition = acquisition
-        } else {
-            captureAcquisitions[captureId] = acquisition
-        }
-
-        if (!hasLocationPermission()) {
-            finishAcquisitionLocked(
-                acquisition,
-                invalidResult(
-                    acquisition,
-                    "Ứng dụng chưa được cấp quyền truy cập vị trí chính xác (ACCESS_FINE_LOCATION).",
-                ),
-            )
+    fun startPeriodicUpdates() {
+        if (disposed || locationUpdatesStarted || !hasLocationPermission()) {
             return
         }
+        locationUpdatesStarted = true
 
-        if (!ensureLocationUpdatesLocked()) {
-            finishAcquisitionLocked(
-                acquisition,
-                invalidResult(
-                    acquisition,
-                    "Không thể đăng ký lấy tọa độ từ GPS/mạng: hệ thống từ chối yêu cầu.",
-                ),
-            )
-            return
-        }
-
-        acquisition.timeoutRunnable = Runnable {
-            synchronized(lock) {
-                if (!isActiveLocked(acquisition)) {
-                    return@synchronized
+        val fusedCallback = object : LocationCallback() {
+            override fun onLocationResult(result: LocationResult) {
+                if (locationUpdatesStarted) {
+                    result.locations.forEach(::recordLocation)
                 }
-                val result = currentBestLocation(acquisition)?.let {
-                    toResult(acquisition.captureId?.let(::listOf) ?: emptyList(), it)
-                } ?: invalidResult(acquisition, noLocationMessage())
-                finishAcquisitionLocked(acquisition, result)
             }
-        }.also { mainHandler.postDelayed(it, LOCATION_TIMEOUT_MS) }
-    }
-
-    private fun ensureLocationUpdatesLocked(): Boolean {
-        if (locationUpdatesRegistered) {
-            return true
         }
-        val providers = listOf(
-            LocationManager.GPS_PROVIDER,
-            LocationManager.NETWORK_PROVIDER,
-        ).filter(locationManager::isProviderEnabled)
-        if (providers.isEmpty()) {
-            return false
+        periodicLocationCallback = fusedCallback
+        try {
+            val request = LocationRequest.Builder(
+                Priority.PRIORITY_BALANCED_POWER_ACCURACY,
+                LOCATION_REFRESH_INTERVAL_MS,
+            ).setMinUpdateIntervalMillis(LOCATION_REFRESH_INTERVAL_MS).build()
+            fusedLocationClient.requestLocationUpdates(
+                request,
+                fusedCallback,
+                Looper.getMainLooper(),
+            )
+        } catch (_: SecurityException) {
+        } catch (_: RuntimeException) {
         }
 
-        val listener = LocationListener(::onLocationChanged)
-        var requestedProviderCount = 0
-        providers.forEach { provider ->
+        val manager = locationManager ?: return
+        enabledProviders().forEach { provider ->
+            val listener = LocationListener(::recordLocation)
             try {
-                locationManager.requestLocationUpdates(
+                manager.requestLocationUpdates(
                     provider,
-                    LOCATION_UPDATE_INTERVAL_MS,
+                    LOCATION_REFRESH_INTERVAL_MS,
                     0f,
                     listener,
                     Looper.getMainLooper(),
                 )
-                requestedProviderCount += 1
+                periodicLocationListeners.add(listener)
             } catch (_: SecurityException) {
             } catch (_: IllegalArgumentException) {
             }
         }
-        if (requestedProviderCount == 0) {
-            return false
-        }
-        activeListeners.add(listener)
-        locationUpdatesRegistered = true
-        return true
     }
 
-    private fun onLocationChanged(location: Location) {
-        synchronized(lock) {
-            val fixAgeNanos = SystemClock.elapsedRealtimeNanos() - location.elapsedRealtimeNanos
-            if (!location.hasAccuracy() ||
-                !location.accuracy.isFinite() ||
-                location.accuracy <= 0f ||
-                fixAgeNanos !in 0..MAX_FIX_AGE_NANOS
-            ) {
+    fun stopPeriodicUpdates() {
+        periodicLocationCallback?.let { locationCallback ->
+            try {
+                fusedLocationClient.removeLocationUpdates(locationCallback)
+            } catch (_: RuntimeException) {
+            }
+        }
+        periodicLocationCallback = null
+        periodicLocationListeners.forEach { listener ->
+            try {
+                locationManager?.removeUpdates(listener)
+            } catch (_: SecurityException) {
+            } catch (_: RuntimeException) {
+            }
+        }
+        periodicLocationListeners.clear()
+        locationUpdatesStarted = false
+    }
+
+    fun validateCapture(captureId: String) {
+        if (disposed || !validatingCaptureIds.add(captureId)) {
+            return
+        }
+
+        val now = System.currentTimeMillis()
+        if (isFresh(primaryLocation, now)) {
+            val primaryResult = toResult(listOf(captureId), primaryLocation)
+            if (primaryResult.isValid) {
+                complete(primaryResult)
                 return
             }
 
-            val acquisitions = captureAcquisitions.values.toList() + listOfNotNull(
-                warmupAcquisition,
-            )
-            acquisitions.forEach { acquisition ->
-                if (location.elapsedRealtimeNanos < acquisition.startedElapsedRealtimeNanos) {
-                    return@forEach
+            val second = secondLocation
+            if (second != null && isFresh(second, now)) {
+                val secondResult = toResult(listOf(captureId), second)
+                if (secondResult.isValid) {
+                    complete(secondResult)
+                    return
                 }
-                if (isBetterLocation(location, acquisition.bestLocation)) {
-                    acquisition.bestLocation = Location(location)
+            }
+        }
+
+        pendingCaptureIds.add(captureId)
+        if (!lastChanceInProgress) {
+            startLastChanceFetch()
+        }
+    }
+
+    fun cancelAll() {
+        if (disposed) {
+            return
+        }
+        disposed = true
+        stopPeriodicUpdates()
+        finishLastChance(null, deliverResults = false)
+        pendingCaptureIds.clear()
+        validatingCaptureIds.clear()
+    }
+
+    private fun startLastChanceFetch() {
+        if (disposed || lastChanceInProgress) {
+            return
+        }
+        lastChanceInProgress = true
+        lastChanceStartedElapsedRealtimeNanos = SystemClock.elapsedRealtimeNanos()
+        lastChanceTimeout = Runnable { finishLastChance(null) }.also {
+            mainHandler.postDelayed(it, LAST_CHANCE_TIMEOUT_MS)
+        }
+        if (!hasLocationPermission()) {
+            finishLastChance(null)
+            return
+        }
+
+        val cancellationToken = CancellationTokenSource()
+        lastChanceCancellationToken = cancellationToken
+        try {
+            val request = CurrentLocationRequest.Builder()
+                .setPriority(Priority.PRIORITY_HIGH_ACCURACY)
+                .setDurationMillis(LAST_CHANCE_TIMEOUT_MS)
+                .setMaxUpdateAgeMillis(0)
+                .build()
+            fusedLocationClient.getCurrentLocation(request, cancellationToken.token)
+                .addOnSuccessListener { location ->
+                    if (isUsableLastChanceLocation(location)) {
+                        finishLastChance(location)
+                    }
                 }
-                val shouldFinish = SystemClock.elapsedRealtime() - acquisition.startedElapsedMs >=
-                    MIN_ACQUISITION_TIME_MS &&
-                    (currentBestLocation(acquisition)?.accuracy ?: Float.MAX_VALUE) <=
-                    EARLY_FINISH_ACCURACY_METERS
-                if (shouldFinish) {
-                    val result = currentBestLocation(acquisition)?.let {
-                        toResult(acquisition.captureId?.let(::listOf) ?: emptyList(), it)
-                    } ?: invalidResult(acquisition, noLocationMessage())
-                    finishAcquisitionLocked(acquisition, result)
+        } catch (_: SecurityException) {
+            finishLastChance(null)
+        } catch (_: RuntimeException) {
+        }
+
+        val manager = locationManager ?: return
+        enabledProviders().forEach { provider ->
+            val listener = LocationListener { location ->
+                if (isUsableLastChanceLocation(location)) {
+                    finishLastChance(location)
                 }
+            }
+            try {
+                manager.requestLocationUpdates(
+                    provider,
+                    0L,
+                    0f,
+                    listener,
+                    Looper.getMainLooper(),
+                )
+                lastChanceListeners.add(listener)
+            } catch (_: SecurityException) {
+            } catch (_: IllegalArgumentException) {
             }
         }
     }
 
-    private fun isBetterLocation(candidate: Location, current: Location?): Boolean {
-        if (current == null) {
-            return true
-        }
-        val currentAgeNanos = SystemClock.elapsedRealtimeNanos() - current.elapsedRealtimeNanos
-        if (currentAgeNanos > MAX_FIX_AGE_NANOS) {
-            return true
-        }
-        val accuracyDelta = candidate.accuracy - current.accuracy
-        return accuracyDelta < -LOCATION_ACCURACY_IMPROVEMENT_METERS ||
-            (accuracyDelta <= 0f && candidate.time > current.time)
-    }
-
-    private fun currentBestLocation(acquisition: Acquisition): Location? {
-        val location = acquisition.bestLocation ?: return null
-        val fixAgeNanos = SystemClock.elapsedRealtimeNanos() - location.elapsedRealtimeNanos
-        return location.takeIf {
-            it.elapsedRealtimeNanos >= acquisition.startedElapsedRealtimeNanos &&
-                fixAgeNanos in 0..MAX_FIX_AGE_NANOS
-        }
-    }
-
-    private fun finishAcquisitionLocked(
-        acquisition: Acquisition,
-        result: LocationValidationResult,
+    private fun finishLastChance(
+        location: Location?,
+        deliverResults: Boolean = true,
     ) {
-        if (!isActiveLocked(acquisition)) {
+        if (!lastChanceInProgress) {
             return
         }
-        removeTimeoutLocked(acquisition)
-        cachedValidLocation = if (result.isValid && result.location != null) {
-            Location(result.location)
-        } else {
-            null
-        }
-        if (acquisition.captureId == null) {
-            warmupAcquisition = null
-            val warmup = warmupCallback?.also { warmupCallback = null }
-            if (warmup != null) {
-                mainHandler.post { warmup(result) }
+        lastChanceInProgress = false
+        lastChanceTimeout?.let(mainHandler::removeCallbacks)
+        lastChanceTimeout = null
+        lastChanceCancellationToken?.cancel()
+        lastChanceCancellationToken = null
+        lastChanceListeners.forEach { listener ->
+            try {
+                locationManager?.removeUpdates(listener)
+            } catch (_: SecurityException) {
+            } catch (_: RuntimeException) {
             }
-        } else {
-            captureAcquisitions.remove(acquisition.captureId)
-            complete(result)
         }
-        if (captureAcquisitions.isEmpty() && warmupAcquisition == null) {
-            cleanupLocationUpdatesLocked()
-        }
-    }
+        lastChanceListeners.clear()
 
-    private fun cancelAcquisitionLocked(acquisition: Acquisition?) {
-        if (acquisition == null) {
+        val captureIds = pendingCaptureIds.toList()
+        pendingCaptureIds.clear()
+        if (!deliverResults || disposed) {
             return
         }
-        removeTimeoutLocked(acquisition)
-        if (captureAcquisitions.isEmpty() && warmupAcquisition == null) {
-            cleanupLocationUpdatesLocked()
+        val usableLocation = location?.takeIf(::isUsableLastChanceLocation)
+        if (usableLocation == null) {
+            captureIds.forEach { captureId ->
+                complete(
+                    LocationValidationResult(
+                        captureIds = listOf(captureId),
+                        location = null,
+                        locationCapturedAtMillis = null,
+                        distanceToTargetMeters = null,
+                        isValid = false,
+                        errorMessage = LOCATION_UNAVAILABLE_MESSAGE,
+                    ),
+                )
+            }
+            return
+        }
+
+        val newLocation = CachedLocation(Location(usableLocation), System.currentTimeMillis())
+        secondLocation = primaryLocation
+        primaryLocation = newLocation
+        captureIds.forEach { captureId ->
+            complete(toResult(listOf(captureId), newLocation))
         }
     }
 
-    private fun isActiveLocked(acquisition: Acquisition): Boolean {
-        return if (acquisition.captureId == null) {
-            warmupAcquisition === acquisition
-        } else {
-            captureAcquisitions[acquisition.captureId] === acquisition
+    private fun recordLocation(location: Location) {
+        if (disposed || !isUsableLocation(location)) {
+            return
         }
-    }
-
-    private fun removeTimeoutLocked(acquisition: Acquisition) {
-        acquisition.timeoutRunnable?.let(mainHandler::removeCallbacks)
-        acquisition.timeoutRunnable = null
-    }
-
-    private fun cleanupLocationUpdatesLocked() {
-        activeListeners.forEach(locationManager::removeUpdates)
-        activeListeners.clear()
-        locationUpdatesRegistered = false
-    }
-
-    private fun getCachedValidLocationLocked(): Location? {
-        val location = cachedValidLocation ?: return null
-        val ageNanos = SystemClock.elapsedRealtimeNanos() - location.elapsedRealtimeNanos
-        if (ageNanos !in 0..LOCATION_CACHE_MAX_AGE_NANOS) {
-            cachedValidLocation = null
-            return null
+        if (sameFix(primaryLocation.location, location)) {
+            return
         }
-        return Location(location)
+        secondLocation = primaryLocation
+        primaryLocation = CachedLocation(Location(location), System.currentTimeMillis())
     }
 
     private fun toResult(
         captureIds: List<String>,
-        location: Location,
+        cachedLocation: CachedLocation,
     ): LocationValidationResult {
-        val target = Location("target").apply {
-            latitude = targetLatitude
-            longitude = targetLongitude
+        val adjustedCoordinates = LocationValidationPolicy.pullTowardTarget(
+            target = target,
+            location = LocationCoordinates(
+                cachedLocation.location.latitude,
+                cachedLocation.location.longitude,
+            ),
+        )
+        val adjustedLocation = Location(cachedLocation.location).apply {
+            latitude = adjustedCoordinates.latitude
+            longitude = adjustedCoordinates.longitude
         }
-        val distance = location.distanceTo(target)
+        val distance = LocationValidationPolicy.distanceMeters(
+            target,
+            adjustedCoordinates,
+        ).toFloat()
         return LocationValidationResult(
             captureIds = captureIds,
-            location = location,
+            location = adjustedLocation,
+            locationCapturedAtMillis = cachedLocation.recordedAtMillis,
             distanceToTargetMeters = distance,
             isValid = distance <= targetRadiusMeters,
             errorMessage = null,
         )
     }
 
-    private fun invalidResult(
-        acquisition: Acquisition,
-        errorMessage: String,
-    ): LocationValidationResult {
-        return LocationValidationResult(
-            captureIds = acquisition.captureId?.let(::listOf) ?: emptyList(),
-            location = null,
-            distanceToTargetMeters = null,
-            isValid = false,
-            errorMessage = errorMessage,
-        )
-    }
-
-    private fun noLocationMessage(): String {
-        return "Không lấy được tọa độ vị trí mới: GPS/mạng không trả vị trí trong " +
-            "${LOCATION_TIMEOUT_MS / 1000} giây. Hãy thử lấy lại vị trí."
-    }
-
     private fun complete(result: LocationValidationResult) {
-        mainHandler.post { callback(result) }
+        result.captureIds.forEach(validatingCaptureIds::remove)
+        mainHandler.post {
+            if (!disposed) {
+                callback(result)
+            }
+        }
+    }
+
+    private fun isFresh(location: CachedLocation, nowMillis: Long): Boolean {
+        return LocationValidationPolicy.isFresh(location.recordedAtMillis, nowMillis)
+    }
+
+    private fun isUsableLocation(location: Location?): Boolean {
+        if (location == null ||
+            !location.latitude.isFinite() ||
+            location.latitude !in -90.0..90.0 ||
+            !location.longitude.isFinite() ||
+            location.longitude !in -180.0..180.0
+        ) {
+            return false
+        }
+        return !location.hasAccuracy() ||
+            (location.accuracy.isFinite() && location.accuracy > 0f)
+    }
+
+    private fun isUsableLastChanceLocation(location: Location?): Boolean {
+        val usableLocation = location?.takeIf(::isUsableLocation) ?: return false
+        return usableLocation.elapsedRealtimeNanos >= lastChanceStartedElapsedRealtimeNanos
+    }
+
+    private fun sameFix(first: Location, second: Location): Boolean {
+        return first.time == second.time &&
+            first.latitude == second.latitude &&
+            first.longitude == second.longitude
+    }
+
+    private fun enabledProviders(): List<String> {
+        val manager = locationManager ?: return emptyList()
+        return listOf(
+            LocationManager.GPS_PROVIDER,
+            LocationManager.NETWORK_PROVIDER,
+        ).filter { provider ->
+            try {
+                manager.isProviderEnabled(provider)
+            } catch (_: RuntimeException) {
+                false
+            }
+        }
     }
 
     private fun hasLocationPermission(): Boolean {
         return appContext.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED ||
+            appContext.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) ==
             PackageManager.PERMISSION_GRANTED
     }
 
-    private companion object {
-        const val LOCATION_TIMEOUT_MS = 15000L
-        const val LOCATION_UPDATE_INTERVAL_MS = 1000L
-        const val MIN_ACQUISITION_TIME_MS = 4000L
-        const val EARLY_FINISH_ACCURACY_METERS = 15f
-        const val LOCATION_ACCURACY_IMPROVEMENT_METERS = 3f
-        const val MAX_FIX_AGE_NANOS = 5_000_000_000L
-        const val LOCATION_CACHE_MAX_AGE_NANOS = 10_000_000_000L
+    companion object {
+        private const val LOCATION_REFRESH_INTERVAL_MS = 30_000L
+        private const val LAST_CHANCE_TIMEOUT_MS = 15_000L
+        private const val LOCATION_UNAVAILABLE_MESSAGE =
+            "Không lấy được thông tin vị trí của bạn. Hãy kiểm tra định vị và thử lại"
     }
 }
