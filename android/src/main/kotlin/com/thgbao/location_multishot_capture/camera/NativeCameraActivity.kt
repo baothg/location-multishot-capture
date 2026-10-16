@@ -639,8 +639,8 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
             val message = if (result.location == null) {
                 result.errorMessage ?: "Không lấy được thông tin vị trí của bạn. Hãy kiểm tra định vị và thử lại"
             } else {
-                result.distanceToTargetMeters?.let { distance ->
-                    "Bạn đang ở ngoài phạm vi cho phép, cách ${formatDistance(distance)}."
+                (result.rawDistanceToTargetMeters ?: result.distanceToTargetMeters)?.let { distance ->
+                    "Bạn đang ở ngoài phạm vi cho phép cách ${formatDistance(distance)}."
                 } ?: "Không xác định được khoảng cách đến vị trí cho phép."
             }
             showLocationFailureDialog(message, errorCode)
@@ -834,8 +834,16 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
     }
 
     private fun formatDistance(distanceMeters: Float): String {
-        val formatter = NumberFormat.getIntegerInstance(Locale("vi", "VN"))
-        return "${formatter.format(distanceMeters.roundToInt())} m"
+        val locale = Locale("vi", "VN")
+        if (distanceMeters < 1000f) {
+            val formatter = NumberFormat.getIntegerInstance(locale)
+            return "${formatter.format(distanceMeters.roundToInt())} m"
+        }
+        val formatter = NumberFormat.getNumberInstance(locale).apply {
+            minimumFractionDigits = 1
+            maximumFractionDigits = 1
+        }
+        return "${formatter.format(distanceMeters / 1000f)} km"
     }
 
     private fun dp(value: Int): Int {

@@ -31,6 +31,7 @@ class LocationValidationService(
         val location: Location?,
         val locationCapturedAtMillis: Long?,
         val distanceToTargetMeters: Float?,
+        val rawDistanceToTargetMeters: Float?,
         val isValid: Boolean,
         val errorMessage: String?,
     )
@@ -265,6 +266,7 @@ class LocationValidationService(
                         location = null,
                         locationCapturedAtMillis = null,
                         distanceToTargetMeters = null,
+                        rawDistanceToTargetMeters = null,
                         isValid = false,
                         errorMessage = LOCATION_UNAVAILABLE_MESSAGE,
                     ),
@@ -296,12 +298,13 @@ class LocationValidationService(
         captureIds: List<String>,
         cachedLocation: CachedLocation,
     ): LocationValidationResult {
+        val originalCoordinates = LocationCoordinates(
+            cachedLocation.location.latitude,
+            cachedLocation.location.longitude,
+        )
         val adjustedCoordinates = LocationValidationPolicy.pullTowardTarget(
             target = target,
-            location = LocationCoordinates(
-                cachedLocation.location.latitude,
-                cachedLocation.location.longitude,
-            ),
+            location = originalCoordinates,
         )
         val adjustedLocation = Location(cachedLocation.location).apply {
             latitude = adjustedCoordinates.latitude
@@ -311,11 +314,16 @@ class LocationValidationService(
             target,
             adjustedCoordinates,
         ).toFloat()
+        val rawDistance = LocationValidationPolicy.distanceMeters(
+            target,
+            originalCoordinates,
+        ).toFloat()
         return LocationValidationResult(
             captureIds = captureIds,
             location = adjustedLocation,
             locationCapturedAtMillis = cachedLocation.recordedAtMillis,
             distanceToTargetMeters = distance,
+            rawDistanceToTargetMeters = rawDistance,
             isValid = distance <= targetRadiusMeters,
             errorMessage = null,
         )
