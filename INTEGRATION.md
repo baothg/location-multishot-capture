@@ -51,7 +51,7 @@ await plugin.clearSessionImages();
 | `targetRadiusMeters` | `double?` | `null` | Must be `> 0` |
 | `initialLatitude` | `double?` | `null` | Required with a location target; current user location supplied by the caller |
 | `initialLongitude` | `double?` | `null` | Required with a location target; current user location supplied by the caller |
-| `maxMegapixels` | `int` | `12` | Cap on captured JPEG resolution |
+| `maxMegapixels` | `int` | unlimited | Cap on captured JPEG resolution |
 
 **Validation modes**
 

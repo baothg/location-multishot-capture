@@ -14,7 +14,7 @@ class CameraConfig {
     this.targetRadiusMeters,
     this.initialLatitude,
     this.initialLongitude,
-    this.maxMegapixels = 12,
+    this.maxMegapixels = 0x7fffffff,
   });
 
   /// Total number of photos the session may hold.
@@ -38,8 +38,7 @@ class CameraConfig {
 
   final double? initialLongitude;
 
-  /// Optional cap for captured JPEG resolution (defaults to 12 MP to keep
-  /// bitmap decode memory bounded on low-end devices).
+  /// Optional cap for captured JPEG resolution.
   final int maxMegapixels;
 
   int get remainingImageCount => maxImages - existingImageCount;

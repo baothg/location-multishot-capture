@@ -354,9 +354,7 @@ class LocationValidationService(
             return false
         }
         return !location.hasAccuracy() ||
-            (location.accuracy.isFinite() &&
-                location.accuracy > 0f &&
-                location.accuracy <= MAX_ACCEPTABLE_ACCURACY_METERS)
+            (location.accuracy.isFinite() && location.accuracy > 0f)
     }
 
     private fun isUsableLastChanceLocation(location: Location?): Boolean {
@@ -397,7 +395,6 @@ class LocationValidationService(
 
     companion object {
         private const val LOCATION_REFRESH_INTERVAL_MS = 30_000L
-        private const val MAX_ACCEPTABLE_ACCURACY_METERS = 200f
         private const val LAST_CHANCE_TIMEOUT_MS = 15_000L
         private const val LOCATION_UNAVAILABLE_MESSAGE =
             "Không lấy được thông tin vị trí của bạn. Hãy kiểm tra định vị và thử lại"
