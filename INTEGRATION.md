@@ -51,7 +51,7 @@ await plugin.clearSessionImages();
 | `targetRadiusMeters` | `double?` | `null` | Must be `> 0` |
 | `initialLatitude` | `double?` | `null` | Required with a location target; current user location supplied by the caller |
 | `initialLongitude` | `double?` | `null` | Required with a location target; current user location supplied by the caller |
-| `maxMegapixels` | `int` | unlimited | Cap on captured JPEG resolution |
+| `maxMegapixels` | `int` | `12` | Cap on captured JPEG resolution |
 
 **Validation modes**
 
@@ -60,8 +60,10 @@ await plugin.clearSessionImages();
   while FLP and Android location updates refresh a primary/secondary cache at a
   30-second target interval while the camera is active. Each capture validates
   against fresh cached locations after pulling them 20% toward the target; a
-  direct 15-second fetch is the final fallback. Failed validation ends the
-  session.
+  direct 15-second fetch is the final fallback. On failure a dialog shows the
+  real (unadjusted) distance and offers **"Thử lại"** — re-running validation
+  for all pending captures without losing them — or **"Đóng"**, which ends
+  the session with an error.
 - **Capture-only mode** — no target fields: only camera permission is
   requested; no location work happens. `latitude`, `longitude` and
   `distanceToTargetMeters` come back as `0`.

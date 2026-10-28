@@ -14,6 +14,8 @@ import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.util.TypedValue
 import android.view.Gravity
@@ -36,6 +38,7 @@ import java.io.File
 import java.text.NumberFormat
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.Executors
 import kotlin.math.roundToInt
 import org.json.JSONArray
 import org.json.JSONObject
@@ -77,6 +80,17 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
     private var cameraController: Camera2Controller? = null
     private var inFlightCaptures = 0
     private var lastShutterTapElapsedMs = 0L
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val imageProcessingExecutor = Executors.newSingleThreadExecutor()
+    private val captureWatchdog = Runnable {
+        if (inFlightCaptures > 0) {
+            inFlightCaptures = 0
+            updateCaptureUi()
+            if (!isFinishing && !resultDelivered) {
+                Toast.makeText(this, "Không thể chụp ảnh.", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
 
     private val captures = linkedMapOf<String, CaptureRecord>()
     private var locationFailureDialogShowing = false
@@ -162,6 +176,8 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
     }
 
     override fun onDestroy() {
+        mainHandler.removeCallbacks(captureWatchdog)
+        imageProcessingExecutor.shutdown()
         if (::locationService.isInitialized) {
             locationService.cancelAll()
         }
@@ -320,45 +336,48 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
         height: Int,
         jpegOrientation: Int,
     ) {
+        mainHandler.removeCallbacks(captureWatchdog)
         val captureId = UUID.randomUUID().toString()
-        val normalizedImage = try {
-            JpegNormalizer.normalize(bytes, jpegOrientation, width, height)
-        } catch (_: Exception) {
-            JpegNormalizer.NormalizedImage(bytes, width, height, jpegOrientation)
-        }
-        val file = try {
-            repository.savePending(captureId, normalizedImage.bytes)
-        } catch (_: Exception) {
-            null
-        }
+        imageProcessingExecutor.execute {
+            val normalizedImage = try {
+                JpegNormalizer.normalize(bytes, jpegOrientation, width, height)
+            } catch (_: Exception) {
+                JpegNormalizer.NormalizedImage(bytes, width, height, jpegOrientation)
+            }
+            val file = try {
+                repository.savePending(captureId, normalizedImage.bytes)
+            } catch (_: Exception) {
+                null
+            }
 
-        runOnUiThread {
-            inFlightCaptures = (inFlightCaptures - 1).coerceAtLeast(0)
-            if (file == null) {
+            runOnUiThread {
+                inFlightCaptures = (inFlightCaptures - 1).coerceAtLeast(0)
+                if (file == null) {
+                    updateCaptureUi()
+                    Toast.makeText(this, "Không thể lưu ảnh.", Toast.LENGTH_SHORT).show()
+                    return@runOnUiThread
+                }
+                if (isFinishing || resultDelivered) {
+                    repository.discard(file)
+                    return@runOnUiThread
+                }
+                captures[captureId] = CaptureRecord(
+                    id = captureId,
+                    file = file,
+                    width = normalizedImage.width,
+                    height = normalizedImage.height,
+                    orientation = normalizedImage.orientation,
+                    timestamp = System.currentTimeMillis(),
+                    status = if (config.hasLocationTarget) {
+                        CaptureStatus.PENDING_LOCATION
+                    } else {
+                        CaptureStatus.VALID
+                    },
+                )
                 updateCaptureUi()
-                Toast.makeText(this, "Không thể lưu ảnh.", Toast.LENGTH_SHORT).show()
-                return@runOnUiThread
-            }
-            if (isFinishing || resultDelivered) {
-                repository.discard(file)
-                return@runOnUiThread
-            }
-            captures[captureId] = CaptureRecord(
-                id = captureId,
-                file = file,
-                width = normalizedImage.width,
-                height = normalizedImage.height,
-                orientation = normalizedImage.orientation,
-                timestamp = System.currentTimeMillis(),
-                status = if (config.hasLocationTarget) {
-                    CaptureStatus.PENDING_LOCATION
-                } else {
-                    CaptureStatus.VALID
-                },
-            )
-            updateCaptureUi()
-            if (config.hasLocationTarget) {
-                locationService.validateCapture(captureId)
+                if (config.hasLocationTarget) {
+                    locationService.validateCapture(captureId)
+                }
             }
         }
     }
@@ -368,6 +387,7 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
     }
 
     override fun onCaptureFailed(message: String) {
+        mainHandler.removeCallbacks(captureWatchdog)
         runOnUiThread {
             inFlightCaptures = (inFlightCaptures - 1).coerceAtLeast(0)
             updateCaptureUi()
@@ -575,6 +595,8 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
         }
         inFlightCaptures += 1
         updateCaptureUi()
+        mainHandler.removeCallbacks(captureWatchdog)
+        mainHandler.postDelayed(captureWatchdog, CAPTURE_WATCHDOG_TIMEOUT_MS)
         cameraController?.captureStillImage()
     }
 
@@ -605,6 +627,9 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
     }
 
     private fun handleBackRequest() {
+        if (locationFailureDialogShowing || permissionDialogShowing) {
+            return
+        }
         if (captures.isEmpty()) {
             finishCancelled()
             return
@@ -684,6 +709,7 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
     }
 
     private fun finishConfirmed(validCaptures: List<CaptureRecord>) {
+        mainHandler.removeCallbacks(captureWatchdog)
         if (::locationService.isInitialized) {
             locationService.cancelAll()
         }
@@ -722,6 +748,7 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
     }
 
     private fun finishCancelled() {
+        mainHandler.removeCallbacks(captureWatchdog)
         if (::locationService.isInitialized) {
             locationService.cancelAll()
         }
@@ -736,6 +763,7 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
     }
 
     private fun finishWithError(code: String, message: String) {
+        mainHandler.removeCallbacks(captureWatchdog)
         if (::locationService.isInitialized) {
             locationService.cancelAll()
         }
@@ -773,16 +801,32 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
             return
         }
         locationFailureDialogShowing = true
-        if (::locationService.isInitialized) {
-            locationService.cancelAll()
-        }
         materialDialogBuilder()
             .setTitle("Không thể xác thực vị trí")
             .setMessage(message)
             .setCancelable(false)
             .setPositiveButton("Đóng") { _, _ -> finishWithError(errorCode, message) }
+            .setNegativeButton("Thử lại") { _, _ -> retryLocationValidation() }
             .show()
-            .also(::styleDialogButtons)
+            .also { dialog ->
+                dialog.getButton(DialogInterface.BUTTON_NEGATIVE)?.apply {
+                    setTextColor(Color.rgb(33, 150, 243))
+                    typeface = Typeface.DEFAULT_BOLD
+                }
+                dialog.getButton(DialogInterface.BUTTON_POSITIVE)
+                    ?.setTextColor(Color.rgb(0x1B, 0x1B, 0x1F))
+            }
+    }
+
+    private fun retryLocationValidation() {
+        locationFailureDialogShowing = false
+        if (isFinishing || resultDelivered || !::locationService.isInitialized) {
+            return
+        }
+        captures.values
+            .filter { it.status == CaptureStatus.PENDING_LOCATION }
+            .forEach { locationService.validateCapture(it.id) }
+        updateCaptureUi()
     }
 
     private fun showInfoDialog(title: String, message: String) {
@@ -864,6 +908,7 @@ class NativeCameraActivity : Activity(), Camera2Controller.Callback {
         const val STATUS_CANCELLED = "cancelled"
         const val STATUS_ERROR = "error"
         private const val SHUTTER_DEBOUNCE_MS = 700L
+        private const val CAPTURE_WATCHDOG_TIMEOUT_MS = 10_000L
 
 
     }

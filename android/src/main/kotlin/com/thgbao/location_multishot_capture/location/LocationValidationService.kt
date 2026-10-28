@@ -148,14 +148,14 @@ class LocationValidationService(
                 complete(primaryResult)
                 return
             }
+        }
 
-            val second = secondLocation
-            if (second != null && isFresh(second, now)) {
-                val secondResult = toResult(listOf(captureId), second)
-                if (secondResult.isValid) {
-                    complete(secondResult)
-                    return
-                }
+        val second = secondLocation
+        if (second != null && isFresh(second, now)) {
+            val secondResult = toResult(listOf(captureId), second)
+            if (secondResult.isValid) {
+                complete(secondResult)
+                return
             }
         }
 
@@ -287,7 +287,9 @@ class LocationValidationService(
         if (disposed || !isUsableLocation(location)) {
             return
         }
-        if (sameFix(primaryLocation.location, location)) {
+        if (sameFix(primaryLocation.location, location) ||
+            location.time < primaryLocation.location.time
+        ) {
             return
         }
         secondLocation = primaryLocation
@@ -352,12 +354,18 @@ class LocationValidationService(
             return false
         }
         return !location.hasAccuracy() ||
-            (location.accuracy.isFinite() && location.accuracy > 0f)
+            (location.accuracy.isFinite() &&
+                location.accuracy > 0f &&
+                location.accuracy <= MAX_ACCEPTABLE_ACCURACY_METERS)
     }
 
     private fun isUsableLastChanceLocation(location: Location?): Boolean {
         val usableLocation = location?.takeIf(::isUsableLocation) ?: return false
-        return usableLocation.elapsedRealtimeNanos >= lastChanceStartedElapsedRealtimeNanos
+        // Some providers leave elapsedRealtimeNanos unset; trust the delivery
+        // time in that case instead of rejecting the fix outright.
+        return usableLocation.elapsedRealtimeNanos == 0L ||
+            usableLocation.elapsedRealtimeNanos >=
+                lastChanceStartedElapsedRealtimeNanos
     }
 
     private fun sameFix(first: Location, second: Location): Boolean {
@@ -389,6 +397,7 @@ class LocationValidationService(
 
     companion object {
         private const val LOCATION_REFRESH_INTERVAL_MS = 30_000L
+        private const val MAX_ACCEPTABLE_ACCURACY_METERS = 200f
         private const val LAST_CHANCE_TIMEOUT_MS = 15_000L
         private const val LOCATION_UNAVAILABLE_MESSAGE =
             "Không lấy được thông tin vị trí của bạn. Hãy kiểm tra định vị và thử lại"
